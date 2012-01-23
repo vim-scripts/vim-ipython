@@ -26,7 +26,7 @@ import vim
 import sys
 
 # get around unicode problems when interfacing with vim
-vim_encoding=vim.eval('&encoding')
+vim_encoding=vim.eval('&encoding') or 'utf-8'
 
 try:
     sys.stdout.flush
@@ -49,28 +49,58 @@ try:
 except NameError:
     km = None
 
-def km_from_string(s):
+def km_from_string(s=''):
     """create kernel manager from IPKernelApp string
-    such as '--shell=47378 --iopub=39859 --stdin=36778 --hb=52668'
+    such as '--shell=47378 --iopub=39859 --stdin=36778 --hb=52668' for IPython 0.11
+    or just 'kernel-12345.json' for IPython 0.12
     """
+    from os.path import join as pjoin
     from IPython.zmq.blockingkernelmanager import BlockingKernelManager, Empty
     from IPython.config.loader import KeyValueConfigLoader
     from IPython.zmq.kernelapp import kernel_aliases
     global km,send,Empty
-    # vim interface currently only deals with existing kernels
-    s = s.replace('--existing','')
-    loader = KeyValueConfigLoader(s.split(), aliases=kernel_aliases)
-    cfg = loader.load_config()['KernelApp']
-    try:
-        km = BlockingKernelManager(
-            shell_address=(ip, cfg['shell_port']),
-            sub_address=(ip, cfg['iopub_port']),
-            stdin_address=(ip, cfg['stdin_port']),
-            hb_address=(ip, cfg['hb_port']))
-    except KeyError,e:
-        echo(":IPython " +s + " failed", "Info")
-        echo("^-- failed --"+e.message.replace('_port','')+" not specified", "Error")
-        return
+
+    s = s.replace('--existing', '')
+    if 'connection_file' in BlockingKernelManager.class_trait_names():
+        from IPython.lib.kernel import find_connection_file
+        # 0.12 uses files instead of a collection of ports
+        # include default IPython search path
+        # filefind also allows for absolute paths, in which case the search
+        # is ignored
+        try:
+            # XXX: the following approach will be brittle, depending on what
+            # connection strings will end up looking like in the future, and
+            # whether or not they are allowed to have spaces. I'll have to sync
+            # up with the IPython team to address these issues -pi
+            if '--profile' in s:
+                k,p = s.split('--profile')
+                k = k.lstrip().rstrip() # kernel part of the string
+                p = p.lstrip().rstrip() # profile part of the string
+                fullpath = find_connection_file(k,p)
+            else:
+                fullpath = find_connection_file(s.lstrip().rstrip())
+        except IOError,e:
+            echo(":IPython " + s + " failed", "Info")
+            echo("^-- failed '" + s + "' not found", "Error")
+            return
+        km = BlockingKernelManager(connection_file = fullpath)
+        km.load_connection_file()
+    else:
+        if s == '':
+            echo(":IPython 0.11 requires the full connection string")
+            return
+        loader = KeyValueConfigLoader(s.split(), aliases=kernel_aliases)
+        cfg = loader.load_config()['KernelApp']
+        try:
+            km = BlockingKernelManager(
+                shell_address=(ip, cfg['shell_port']),
+                sub_address=(ip, cfg['iopub_port']),
+                stdin_address=(ip, cfg['stdin_port']),
+                hb_address=(ip, cfg['hb_port']))
+        except KeyError,e:
+            echo(":IPython " +s + " failed", "Info")
+            echo("^-- failed --"+e.message.replace('_port','')+" not specified", "Error")
+            return
     km.start_channels()
     send = km.shell_channel.execute
     return km
@@ -170,14 +200,29 @@ def update_subchannel_msgs(debug=False):
         db = vim.current.buffer
     else:
         db = []
-    startedin_vimipython = vim.current.buffer.name.endswith('vim-ipython')
+    b = vim.current.buffer
+    startedin_vimipython = vim.eval('@%')=='vim-ipython'
     if not startedin_vimipython:
-        vim.command("pcl")
-        vim.command("silent pedit vim-ipython")
-        vim.command("normal P") #switch to preview window
-    # subchannel window quick quit key 'q'
-    vim.command('map <buffer> q :q<CR>')
-    vim.command("set bufhidden=hide buftype=nofile ft=python")
+        # switch to preview window
+        vim.command(
+            "try"
+            "|silent! wincmd P"
+            "|catch /^Vim\%((\a\+)\)\=:E441/"
+            "|silent pedit +set\ ma vim-ipython"
+            "|silent! wincmd P"
+            "|endtry")
+        # if the current window is called 'vim-ipython'
+        if vim.eval('@%')=='vim-ipython':
+            # set the preview window height to the current height
+            vim.command("set pvh=" + vim.eval('winheight(0)'))
+        else:
+            # close preview window, it was something other than 'vim-ipython'
+            vim.command("pcl")
+            vim.command("silent pedit +set\ ma vim-ipython")
+            vim.command("wincmd P") #switch to preview window
+            # subchannel window quick quit key 'q'
+            vim.command('map <buffer> q :q<CR>')
+            vim.command("set bufhidden=hide buftype=nofile ft=python")
     
     #syntax highlighting for python prompt
     # QtConsole In[] is blue, but I prefer the oldschool green
@@ -192,26 +237,29 @@ def update_subchannel_msgs(debug=False):
     for m in msgs:
         #db.append(str(m).splitlines())
         s = ''
-        if 'msg_type' not in m:
+        if 'msg_type' not in m['header']:
             # debug information
             #echo('skipping a message on sub_channel','WarningMsg')
             #echo(str(m))
             continue
-        elif m['msg_type'] == 'status':
+        elif m['header']['msg_type'] == 'status':
             continue
-        elif m['msg_type'] == 'stream':
+        elif m['header']['msg_type'] == 'stream':
             s = strip_color_escapes(m['content']['data'])
-        elif m['msg_type'] == 'pyout':
+        elif m['header']['msg_type'] == 'pyout':
             s = "Out[%d]: " % m['content']['execution_count']
             s += m['content']['data']['text/plain']
-        elif m['msg_type'] == 'pyin':
+        elif m['header']['msg_type'] == 'pyin':
             # TODO: the next line allows us to resend a line to ipython if
             # %doctest_mode is on. In the future, IPython will send the
             # execution_count on subchannel, so this will need to be updated
             # once that happens
-            s = "\nIn [00]: "
+            if 'execution_count' in m['content']:
+                s = "\nIn [%d]: "% m['content']['execution_count']
+            else:
+                s = "\nIn [00]: "
             s += m['content']['code'].strip()
-        elif m['msg_type'] == 'pyerr':
+        elif m['header']['msg_type'] == 'pyerr':
             c = m['content']
             s = "\n".join(map(strip_color_escapes,c['traceback']))
             s += c['ename'] + ":" + c['evalue']
@@ -226,6 +274,9 @@ def update_subchannel_msgs(debug=False):
                 b.append(s.splitlines())
             except:
                 b.append([l.encode(vim_encoding) for l in s.splitlines()])
+    # make a newline so we can just start typing there
+    if b[-1] != '':
+        b.append([''])
     vim.command('normal G') # go to the end of the file
     if not startedin_vimipython:
         vim.command('normal p') # go back to where you were
@@ -256,11 +307,11 @@ def print_prompt(prompt,msg_id=None):
     else:
         echo("In[]: %s" % prompt)
 
-def with_subchannel(f):
+def with_subchannel(f,*args):
     "conditionally monitor subchannel"
-    def f_with_update():
+    def f_with_update(*args):
         try:
-            f()
+            f(*args)
             if monitor_subchannel:
                 update_subchannel_msgs()
         except AttributeError: #if km is None
@@ -276,6 +327,13 @@ def run_this_file():
 def run_this_line():
     msg_id = send(vim.current.line)
     print_prompt(vim.current.line, msg_id)
+
+@with_subchannel
+def run_command(cmd):
+    msg_id = send(cmd)
+    print_prompt(cmd, msg_id)
+    if monitor_subchannel:
+        update_subchannel_msgs()
 
 @with_subchannel
 def run_these_lines():
@@ -299,12 +357,15 @@ def run_these_lines():
 def dedent_run_this_line():
     vim.command("left")
     run_this_line()
-    vim.command("undo")
+    vim.command("silent undo")
 
 def dedent_run_these_lines():
-    vim.command("'<,'>left")
+    r = vim.current.range
+    shiftwidth = vim.eval('&shiftwidth')
+    count = int(vim.eval('indent(%d+1)/%s' % (r.start,shiftwidth)))
+    vim.command("'<,'>" + "<"*count)
     run_these_lines()
-    vim.command("undo")
+    vim.command("silent undo")
     
 #def set_this_line():
 #    # not sure if there's a way to do this, since we have multiple clients
@@ -353,36 +414,45 @@ fun! <SID>toggle_send_on_save()
     endif
 endfun
 
-map <silent> <F5> :python run_this_file()<CR>
-map <silent> <S-F5> :python run_this_line()<CR>
-map <silent> <F9> :python run_these_lines()<CR>
-map <silent> <leader>d :py get_doc_buffer()<CR>
-map <silent> <leader>s :py update_subchannel_msgs(); echo("vim-ipython shell updated",'Operator')<CR>
-map <silent> <S-F9> :python toggle_reselect()<CR>
-"map <silent> <C-F6> :python send('%pdb')<CR>
-"map <silent> <F6> :python set_breakpoint()<CR>
-"map <silent> <s-F6> :python clear_breakpoint()<CR>
-"map <silent> <F7> :python run_this_file_pdb()<CR>
-"map <silent> <s-F7> :python clear_all_breaks()<CR>
-imap <C-F5> <C-O><F5>
-imap <S-F5> <C-O><S-F5>
-imap <silent> <F5> <C-O><F5>
-map <C-F5> :call <SID>toggle_send_on_save()<CR>
+" Allow custom mappings
+if !exists('g:ipy_perform_mappings')
+    let g:ipy_perform_mappings = 1
+endif
+if g:ipy_perform_mappings != 0
+    map <silent> <F5> :python run_this_file()<CR>
+    map <silent> <S-F5> :python run_this_line()<CR>
+    map <silent> <F9> :python run_these_lines()<CR>
+    map <silent> <leader>d :py get_doc_buffer()<CR>
+    map <silent> <leader>s :py update_subchannel_msgs(); echo("vim-ipython shell updated",'Operator')<CR>
+    map <silent> <S-F9> :python toggle_reselect()<CR>
+    "map <silent> <C-F6> :python send('%pdb')<CR>
+    "map <silent> <F6> :python set_breakpoint()<CR>
+    "map <silent> <s-F6> :python clear_breakpoint()<CR>
+    "map <silent> <F7> :python run_this_file_pdb()<CR>
+    "map <silent> <s-F7> :python clear_all_breaks()<CR>
+    imap <C-F5> <C-O><F5>
+    imap <S-F5> <C-O><S-F5>
+    imap <silent> <F5> <C-O><F5>
+    map <C-F5> :call <SID>toggle_send_on_save()<CR>
+    "" Example of how to quickly clear the current plot with a keystroke
+    "map <silent> <F12> :python run_command("plt.clf()")<cr>
+    "" Example of how to quickly close all figures with a keystroke
+    "map <silent> <F11> :python run_command("plt.close('all')")<cr>
 
-"pi custom
-map <silent> <C-Return> :python run_this_file()<CR>
-map <silent> <C-s> :python run_this_line()<CR>
-imap <silent> <C-s> <C-O>:python run_this_line()<CR>
-map <silent> <M-s> :python dedent_run_this_line()<CR>
-vmap <silent> <C-S> :python run_these_lines()<CR>
-vmap <silent> <M-s> :python dedent_run_these_lines()<CR>
-map <silent> <C-p> :python set_this_line()<CR>
-map <silent> <M-c> I#<ESC>
-vmap <silent> <M-c> I#<ESC>
-map <silent> <M-C> :s/^\([ \t]*\)#/\1/<CR>
-vmap <silent> <M-C> :s/^\([ \t]*\)#/\1/<CR>
+    "pi custom
+    map <silent> <C-Return> :python run_this_file()<CR>
+    map <silent> <C-s> :python run_this_line()<CR>
+    imap <silent> <C-s> <C-O>:python run_this_line()<CR>
+    map <silent> <M-s> :python dedent_run_this_line()<CR>
+    vmap <silent> <C-S> :python run_these_lines()<CR>
+    vmap <silent> <M-s> :python dedent_run_these_lines()<CR>
+    map <silent> <M-c> I#<ESC>
+    vmap <silent> <M-c> I#<ESC>
+    map <silent> <M-C> :s/^\([ \t]*\)#/\1/<CR>
+    vmap <silent> <M-C> :s/^\([ \t]*\)#/\1/<CR>
+endif
 
-command! -nargs=+ IPython :py km_from_string("<args>")
+command! -nargs=* IPython :py km_from_string("<args>")
 command! -nargs=0 IPythonClipboard :py km_from_string(vim.eval('@+'))
 command! -nargs=0 IPythonXSelection :py km_from_string(vim.eval('@*'))
 
